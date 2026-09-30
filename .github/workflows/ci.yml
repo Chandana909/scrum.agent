@@ -77,8 +77,9 @@ jobs:
       - name: aamt's tests without the patch (baseline)
         working-directory: aamt
         run: |
-          PY=.venv/bin/python; [ -x "$PY" ] || PY=.venv/Scripts/python.exe
-          "$PY" -m pytest -q -p no:cacheprovider $LIVE_MODEL_TESTS --junitxml=../baseline.xml || true
+          # activate the venv: aamt's verification step runs `python -m pytest` as a subprocess
+          if [ -d .venv/bin ]; then export PATH="$PWD/.venv/bin:$PATH"; else export PATH="$PWD/.venv/Scripts:$PATH"; fi
+          python -m pytest -q -p no:cacheprovider $LIVE_MODEL_TESTS --junitxml=../baseline.xml || true
       - name: Apply the integration patch
         working-directory: aamt
         run: |
@@ -88,7 +89,8 @@ jobs:
       - name: aamt's tests with the patch
         working-directory: aamt
         run: |
-          PY=.venv/bin/python; [ -x "$PY" ] || PY=.venv/Scripts/python.exe
-          "$PY" -m pytest -q -p no:cacheprovider $LIVE_MODEL_TESTS --junitxml=../patched.xml || true
+          # activate the venv: aamt's verification step runs `python -m pytest` as a subprocess
+          if [ -d .venv/bin ]; then export PATH="$PWD/.venv/bin:$PATH"; else export PATH="$PWD/.venv/Scripts:$PATH"; fi
+          python -m pytest -q -p no:cacheprovider $LIVE_MODEL_TESTS --junitxml=../patched.xml || true
       - name: No test may fail because of the patch
         run: python aamt-context/integration/compare_junit.py baseline.xml patched.xml

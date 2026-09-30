@@ -33,7 +33,9 @@ uv run pytest
 ```
 
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs these on Linux and Windows with Python
-3.11 and 3.12. It also applies the patch to aamt at the pinned commit and runs aamt's own test suite.
+3.11 and 3.12. On both platforms it also runs aamt's test suite at the pinned commit, with and
+without the patch, and fails if the patch breaks any test aamt passes on its own
+([integration/compare_junit.py](integration/compare_junit.py)).
 
 ---
 

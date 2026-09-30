@@ -45,7 +45,7 @@
 - Logging for every failure the package survives. Swallowed exceptions are otherwise invisible.
 - A `py.typed` marker.
 - CI: lint, type check and tests on Linux and Windows × Python 3.11 and 3.12. A second job applies
-  the patch to aamt and runs aamt's tests.
+  the patch to aamt and compares aamt's own tests with and without it, on Linux and Windows.
 - ruff and pyright versions pinned in the dev group.
 - 15 regression tests, one per fix above. They were confirmed to fail on the old code.
 

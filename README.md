@@ -134,7 +134,8 @@ integration tests run against the real host code. There are 97 tests, and none n
 network access.
 
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs lint, type check and tests on Linux and
-Windows with Python 3.11 and 3.12. It also applies the patch to aamt and runs aamt's own test suite.
+Windows with Python 3.11 and 3.12. On both platforms it also runs aamt's test suite with and without
+the patch, and fails if the patch breaks any test aamt passes on its own.
 Integration steps are in [TASKS.md](TASKS.md); changes are in [CHANGELOG.md](CHANGELOG.md).
 
 If this folder is synced by OneDrive/Dropbox, keep the virtualenv outside it by setting
