@@ -61,11 +61,11 @@ DeepAgents/LangChain middleware described below.
 
 | aamt_context today | Lines | Fate |
 |---|---:|---|
-| `condensers.py`, `session.py`, `harness.py` (`AgentLoop`), the `WorkingLog` view machinery in `worklog.py`, `pre_model_hook` / `ContextMiddleware` / `wrap_tools` in `integrations/langchain.py`, `tokens.py` | ≈1,150 | **Retire** after migrating to `create_agent` + upstream middleware. Keep until then (the current aamt patch uses them). |
+| `condensers.py`, `session.py`, `harness.py` (`AgentLoop`), the `WorkingLog` view machinery in `worklog.py` (`Condensation`, `ContextEdit`, `WorkingLog`, `repair`), and in `integrations/langchain.py` `pre_model_hook` / `ContextMiddleware` / `messages_from_entries` / the `AgentLoop` model adapters | ≈900 | **Retire** after migrating to `create_agent` + upstream middleware. Keep until then (the current aamt patch uses them). |
 | `clipper.py` | 85 | **Keep** while aamt keeps its own `read_file` tool (see §3.3). Retire when the team adopts DeepAgents' file tools. |
 | `codemap.py` | 173 | **Replace** with an Aider-derived tree-sitter repo map. Keep the `ast` outline as a no-dependency fallback. |
 | `llm.py` (`complete_json`) | 79 | **Shrink**: structured output does the parsing. Keep only the fallback. |
-| `types.py`, `store.py`, `memory.py`, `channels.py`, `meetings.py`, `lessons.py`, `briefs.py`, `assembly.py`, `engine.py`, `attempts.py`, `trace.py`, `integrations/aamt.py`, `_util.py`, `config.py` | ≈3,900 | **Keep**: domain logic with no open-source equivalent. Improve it with sqlite-vec, fastembed and structured output. |
+| `types.py`, `store.py`, `memory.py`, `channels.py`, `meetings.py`, `lessons.py`, `briefs.py`, `assembly.py`, `engine.py`, `attempts.py`, `trace.py`, `tokens.py` (the counter interface), `integrations/aamt.py`, `_util.py`, `config.py` | ≈3,950 | **Keep**: domain logic with no open-source equivalent. Improve it with sqlite-vec, fastembed and structured output. |
 
 **Don't adopt (evidence in §2 and §7):**
 
@@ -181,7 +181,7 @@ This is the single biggest overlap between what I built and what upstream now ma
   * DeepAgents `SummarizationMiddleware` + `SummarizationToolMiddleware`;
   * LangChain `ContextEditingMiddleware`;
   * `count_tokens_approximately` with usage scaling.
-* **Retire** the ≈1,150 lines listed in §0 after migration.
+* **Retire** the ≈900 lines listed in §0 after migration.
 * **Settings for aamt's 32k window.** Fractional triggers (`("fraction", 0.8)`) need a model
   profile, which OpenRouter models via `ChatOpenAI` may not have. Use token counts:
   * summarise at 75% of the window, keeping about 25% of the most recent messages;
