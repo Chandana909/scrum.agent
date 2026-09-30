@@ -28,6 +28,9 @@ What it gives the team:
 The core depends only on `pydantic`; LangChain/LangGraph and aamt adapters live in
 `aamt_context.integrations`.
 
+> **Where to download what:** [docs/09-where-to-get-it.md](docs/09-where-to-get-it.md) has the links,
+> install commands and classes for the shared-memory and context-management pieces to adopt.
+>
 > **Building on open source.** [docs/08-adopt-adapt-keep.md](docs/08-adopt-adapt-keep.md) checks each
 > project in the design notes for licence, maintenance, co-installability with aamt, and fit. The
 > spikes are in `docs/spikes/`.

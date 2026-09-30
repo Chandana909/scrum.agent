@@ -1,5 +1,10 @@
 # 08 — Adopt, adapt or keep: building on the open-source projects instead of from scratch
 
+> **Only need the download links?** [09 — Where to get each piece](09-where-to-get-it.md) covers
+> just shared memory and context management: links, install commands and classes. This page is the
+> full analysis. Its sections on code maps and bank guardrails (§3.11, §3.12) go beyond those two
+> parts.
+
 Evaluated on 2026-09-29 against aamt at commit `516a4be`. That commit's loose pins resolve to
 langchain 1.4.3, langchain-core 1.6.6 and langgraph 1.2.12. Tests ran on Python 3.11 and 3.12 on
 Windows 11.

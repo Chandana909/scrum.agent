@@ -22,6 +22,10 @@ Read in order:
    building. For each project it gives licence, maintenance, whether it co-installs with aamt, and
    telemetry defaults, all verified. It then goes component by component with integration code, a
    step-by-step migration plan and risks. The spikes are in [`spikes/`](spikes/).
+9. **[09 — Where to get each piece](09-where-to-get-it.md)**: shared memory and context management
+   only. For each piece to adopt it gives the download link (PyPI), the source (GitHub), the docs,
+   the install command, the class to use and where it plugs in. It also lists what was looked at and
+   not adopted, with links.
 
 ## The short version
 
