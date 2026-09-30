@@ -1,0 +1,477 @@
+diff --git a/src/aamt/agents/base.py b/src/aamt/agents/base.py
+index c73c14a..4dc14e9 100644
+--- a/src/aamt/agents/base.py
++++ b/src/aamt/agents/base.py
+@@ -8,6 +8,7 @@ agents will reuse in later phases.
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
++from typing import Any
+ 
+ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+ from langchain_core.tools import BaseTool
+@@ -34,9 +35,10 @@ class AgentRunResult:
+ 
+ 
+ class BaseAgent:
+-    def __init__(self, spec: AgentSpec, *, settings: Settings | None = None):
++    def __init__(self, spec: AgentSpec, *, settings: Settings | None = None, context: Any | None = None):
+         self.spec = spec
+         self.settings = settings or get_settings()
++        self.context = context  # AamtTaskContext: tool-output clipping + transcript condensation
+ 
+     # --- lazily built model ------------------------------------------
+     def _model(self):
+@@ -60,7 +62,10 @@ class BaseAgent:
+         max_steps: int | None = None,
+     ) -> AgentRunResult:
+         max_steps = max_steps or self.settings.max_agent_steps
+-        agent = create_react_agent(self._model(), tools)
++        hook = None
++        if self.context is not None:
++            tools, hook = self.context.instrument(tools)
++        agent = create_react_agent(self._model(), tools, pre_model_hook=hook)
+         sys = system_prompt or self.spec.system_prompt
+ 
+         try:
+@@ -74,6 +79,8 @@ class BaseAgent:
+             )
+ 
+         msgs: list[BaseMessage] = state["messages"]
++        if self.context is not None:
++            self.context.finish_run(msgs)
+         tool_calls: list[str] = []
+         steps = 0
+         for m in msgs:
+diff --git a/src/aamt/agents/developer.py b/src/aamt/agents/developer.py
+index ded80f6..68d18d8 100644
+--- a/src/aamt/agents/developer.py
++++ b/src/aamt/agents/developer.py
+@@ -24,15 +24,15 @@ def render_task_context(task: Task, *, project_summary: str = "", extra: str = "
+         f"\n## Acceptance criteria\n{ac}",
+     ]
+     if project_summary:
+-        parts.append(f"\n## Project\n{project_summary}")
++        parts.append(f"\n## Team context\n{project_summary}")
+     if extra:
+         parts.append(f"\n## Additional context\n{extra}")
+     return "\n".join(parts)
+ 
+ 
+ class DeveloperAgent(BaseAgent):
+-    def __init__(self, role: str = "backend", *, settings: Settings | None = None):
+-        super().__init__(role_spec(role), settings=settings or get_settings())
++    def __init__(self, role: str = "backend", *, settings: Settings | None = None, context=None):
++        super().__init__(role_spec(role), settings=settings or get_settings(), context=context)
+ 
+     def implement(
+         self,
+diff --git a/src/aamt/agents/scrum_master.py b/src/aamt/agents/scrum_master.py
+index 6e659a9..a397b1a 100644
+--- a/src/aamt/agents/scrum_master.py
++++ b/src/aamt/agents/scrum_master.py
+@@ -263,5 +263,8 @@ class ScrumMaster:
+             sprint_id=sprint_id,
+             decision=decision,
+             context=context,
++            reason=reason,
++            decision_id=d.id,
++            related_tasks=d.related_tasks,
+         )
+         return d
+diff --git a/src/aamt/config.py b/src/aamt/config.py
+index 0170672..e884389 100644
+--- a/src/aamt/config.py
++++ b/src/aamt/config.py
+@@ -108,6 +108,12 @@ class Settings(BaseSettings):
+     human_mode: str = "APPROVAL"            # AUTONOMOUS | APPROVAL | SUPERVISED
+     control_file: str = "CONTROL"           # pause/resume sentinel under data_dir
+ 
++    # --- shared memory / context management (aamt-context) ------
++    enable_context_engine: bool = True      # False: agents get only the project summary
++    context_window_tokens: int = 32_000     # model context window the budgets are cut from
++    context_brief_tokens: int = 6_000       # supporting context injected per task
++    context_memory_tools: bool = False      # give developers memory_search/read/note tools
++
+     def ensure_dirs(self) -> None:
+         self.data_dir.mkdir(parents=True, exist_ok=True)
+         self.workspace_dir.mkdir(parents=True, exist_ok=True)
+@@ -120,6 +126,10 @@ class Settings(BaseSettings):
+     def checkpoint_db_path(self) -> Path:
+         return self.data_dir / "checkpoints.db"
+ 
++    @property
++    def context_db_path(self) -> Path:
++        return self.data_dir / "context.db"
++
+ 
+ _settings: Settings | None = None
+ 
+diff --git a/src/aamt/context.py b/src/aamt/context.py
+new file mode 100644
+index 0000000..57ad2b3
+--- /dev/null
++++ b/src/aamt/context.py
+@@ -0,0 +1,50 @@
++"""Wiring for aamt-context: shared memory + context management for the team.
++
++The orchestrator builds one bridge per run. The bridge listens to the event bus (events
++become shared memory), builds each task's supporting context, and hands the task graph
++per-task hooks (tool-output clipping, transcript condensation, attempt memory).
++"""
++
++from __future__ import annotations
++
++from aamt_context import BudgetConfig, ContextConfig, ContextEngine
++from aamt_context.integrations.aamt import AamtContextBridge
++from aamt_context.integrations.langchain import LangChainTextLLM
++
++from .config import Settings
++from .events.bus import EventBus
++from .llm.provider import build_chat_model
++from .state.store import ProjectStore
++
++
++class _LazyLLM:
++    """Build the summariser model on first use, so no API key is needed to start a run.
++
++    Summaries and minutes fall back to deterministic extraction if this raises.
++    """
++
++    def __init__(self, settings: Settings):
++        self._settings = settings
++        self._llm: LangChainTextLLM | None = None
++
++    def complete(self, system: str, prompt: str, *, max_tokens: int = 1024) -> str:
++        if self._llm is None:
++            self._llm = LangChainTextLLM(
++                build_chat_model(model=self._settings.coordinator_model, settings=self._settings)
++            )
++        return self._llm.complete(system, prompt, max_tokens=max_tokens)
++
++
++def build_context_bridge(settings: Settings, store: ProjectStore, bus: EventBus) -> AamtContextBridge:
++    config = ContextConfig(
++        budget=BudgetConfig(
++            window_tokens=settings.context_window_tokens,
++            reserve_output_tokens=settings.llm_max_tokens,
++        ),
++        brief_tokens=settings.context_brief_tokens,
++    )
++    engine = ContextEngine.open(settings.context_db_path, config=config, llm=_LazyLLM(settings))
++    # the task graph records attempts through the task context, so skip the event fallback
++    bridge = AamtContextBridge(engine, memory_tools=settings.context_memory_tools, attempts_from_events=False)
++    bridge.attach(bus, store=store)
++    return bridge
+diff --git a/src/aamt/orchestrator/orchestrator.py b/src/aamt/orchestrator/orchestrator.py
+index b41fbda..3a3d919 100644
+--- a/src/aamt/orchestrator/orchestrator.py
++++ b/src/aamt/orchestrator/orchestrator.py
+@@ -55,6 +55,11 @@ class Orchestrator:
+         self.sm = ScrumMaster(self.store, self.bus, settings=self.settings)
+         self.manager = AgentManager(self.store)
+         self.reviewer = ReviewerAgent(self.settings)
++        self.context = None
++        if self.settings.enable_context_engine:
++            from ..context import build_context_bridge
++
++            self.context = build_context_bridge(self.settings, self.store, self.bus)
+ 
+     # --- human controls (phased plan §10.6) --------------------------
+     @property
+@@ -173,9 +178,11 @@ class Orchestrator:
+                 workspace_root=project.repo_path or ".",
+                 agent_role=role,
+                 settings=self.settings,
+-                project_summary=self._project_summary(project),
++                project_summary=self._context_for(project, task, agent, sprint),
+                 project_id=project.id,
+                 sprint_id=sprint.id,
++                context=self.context.task_context(project, task, agent=agent, sprint=sprint)
++                if self.context else None,
+             )
+ 
+             self.store.save_task(result.task)
+@@ -373,6 +380,9 @@ class Orchestrator:
+                 agent_report(self.store, self.bus), encoding="utf-8")
+             (reports_dir / "daily.md").write_text(
+                 daily_report(self.store, self.bus), encoding="utf-8")
++            if self.context:
++                (reports_dir / "decisions.md").write_text(
++                    self.context.decision_log_markdown(project.id), encoding="utf-8")
+ 
+             self.bus.emit(EventType.DECISION_RECORDED, project_id=project.id,
+                           decision=f"final report written to {path}", context="reporting")
+@@ -419,6 +429,12 @@ class Orchestrator:
+             )
+         return revived
+ 
++    def _context_for(self, project: Project, task, agent, sprint: Sprint) -> str:
++        """What the developer sees besides the task: shared memory when enabled."""
++        if self.context is None:
++            return self._project_summary(project)
++        return self.context.brief_for_task(project, task, agent=agent, sprint=sprint)
++
+     def _project_summary(self, project: Project) -> str:
+         c = project.constraints
+         bits = [f"{project.name}: {project.problem_statement}"]
+@@ -441,5 +457,7 @@ class Orchestrator:
+         )
+ 
+     def close(self) -> None:
++        if self.context:
++            self.context.engine.close()
+         self.store.close()
+         self.bus.close()
+diff --git a/src/aamt/runtime/task_graph.py b/src/aamt/runtime/task_graph.py
+index 96be241..7eb6626 100644
+--- a/src/aamt/runtime/task_graph.py
++++ b/src/aamt/runtime/task_graph.py
+@@ -108,7 +108,7 @@ def _mk_workspace(state: TaskRunState, settings: Settings) -> Workspace:
+ # --------------------------------------------------------------------------
+ # nodes
+ # --------------------------------------------------------------------------
+-def _make_nodes(settings: Settings):
++def _make_nodes(settings: Settings, context: Any | None = None):
+     def prepare(state: TaskRunState) -> dict[str, Any]:
+         task = Task.model_validate(state["task"])
+         ws = _mk_workspace(state, settings)
+@@ -142,12 +142,13 @@ def _make_nodes(settings: Settings):
+         ws = _mk_workspace(state, settings)
+         attempt = state.get("attempt", 1)
+ 
+-        agent = DeveloperAgent(state["agent_role"], settings=settings)
++        agent = DeveloperAgent(state["agent_role"], settings=settings, context=context)
++        feedback = state.get("last_feedback", "")
+         res = agent.implement(
+             task,
+             ws,
+             project_summary=state.get("project_summary", ""),
+-            extra_context=state.get("last_feedback", ""),
++            extra_context=context.retry_context(feedback) if context else feedback,
+         )
+ 
+         events: list[dict[str, Any]] = [
+@@ -157,6 +158,8 @@ def _make_nodes(settings: Settings):
+         ]
+ 
+         if not res.ok:
++            if context:
++                context.record_attempt(attempt, outcome="error", feedback=res.error or "")
+             max_attempts = state.get("max_attempts", settings.max_task_retries)
+             failed_ev = events + [
+                 {"type": EventType.AGENT_FAILED.value,
+@@ -189,6 +192,8 @@ def _make_nodes(settings: Settings):
+             }
+ 
+         if res.claims_blocked:
++            if context:
++                context.record_attempt(attempt, outcome="blocked", feedback=res.summary)
+             return {
+                 "agent_summary": res.summary,
+                 "outcome": "blocked",
+@@ -237,6 +242,9 @@ def _make_nodes(settings: Settings):
+             return {"verification": verdict, "_next": "commit",
+                     "log": [f"verify[{attempt}]: PASS"], "events": events}
+ 
++        if context:
++            context.record_attempt(attempt, outcome="verify_failed", feedback=report.feedback_for_agent())
++
+         if attempt < state.get("max_attempts", settings.max_task_retries):
+             return {
+                 "verification": verdict,
+@@ -323,9 +331,11 @@ def _make_nodes(settings: Settings):
+ # --------------------------------------------------------------------------
+ # graph
+ # --------------------------------------------------------------------------
+-def build_task_graph(settings: Settings | None = None, *, checkpointer: Any | None = None):
++def build_task_graph(
++    settings: Settings | None = None, *, checkpointer: Any | None = None, context: Any | None = None
++):
+     settings = settings or get_settings()
+-    prepare, develop, verify, commit, escalate = _make_nodes(settings)
++    prepare, develop, verify, commit, escalate = _make_nodes(settings, context)
+ 
+     g = StateGraph(TaskRunState)
+     g.add_node("prepare", prepare)
+@@ -359,14 +369,16 @@ def run_task(
+     project_id: str | None = None,
+     sprint_id: str | None = None,
+     max_attempts: int | None = None,
++    context: Any | None = None,
+ ) -> TaskRunResult:
+     """Run one task end to end. Returns the updated task, outcome and event list.
+ 
+     The caller is responsible for persisting the task and emitting ``events`` to
+     the project event bus (kept out of here so the graph stays I/O-light).
++    ``context`` (an ``AamtTaskContext``) adds context management and attempt memory.
+     """
+     settings = settings or get_settings()
+-    graph = build_task_graph(settings)
++    graph = build_task_graph(settings, context=context)
+ 
+     init: TaskRunState = {
+         "task": task.model_dump(),
+diff --git a/tests/test_context_integration.py b/tests/test_context_integration.py
+new file mode 100644
+index 0000000..5fafa09
+--- /dev/null
++++ b/tests/test_context_integration.py
+@@ -0,0 +1,157 @@
++"""aamt-context wiring: attempt memory, agent instrumentation, briefs from shared memory."""
++
++from __future__ import annotations
++
++import pytest
++from langchain_core.messages import AIMessage, HumanMessage
++
++from aamt.agents.base import AgentRunResult, BaseAgent
++from aamt.config import Settings
++from aamt.models import Project, Task, TaskStatus
++from aamt.models.agent import AgentSpec
++from aamt.planning.schemas import (
++    BacklogPlan, PlannedCriterion, PlannedFeature, PlannedStory, PlannedTask,
++)
++from aamt.runtime import task_graph as tg
++from aamt.runtime.task_graph import TaskRunResult
++from aamt.runtime.verification import VerificationReport
++from aamt.tools.test_runner import TestOutcome
++from aamt.tools.workspace import Workspace
++from aamt_context import ContextEngine
++from aamt_context.integrations.aamt import AamtContextBridge
++
++
++def _settings(tmp_path, **kw) -> Settings:
++    return Settings(data_dir=tmp_path / "d", workspace_dir=tmp_path / "w",
++                    test_command="python -m pytest -q", **kw)
++
++
++def test_failed_verification_is_remembered_for_the_retry(tmp_path, monkeypatch):
++    repo = Workspace(tmp_path / "repo")
++    repo.ensure_git_repo()
++    repo.write_file("README.md", "x\n")
++    repo.commit_all("init")
++    engine = ContextEngine.open(tmp_path / "context.db")
++    project = Project(name="p", problem_statement="demo", repo_path=str(repo.root))
++    task = Task(title="add feature", role="backend")
++    ctx = AamtContextBridge(engine).task_context(project, task)
++    seen: list[str] = []
++
++    class FakeAgent:
++        def __init__(self, *a, **k):
++            assert k.get("context") is ctx
++        def implement(self, task, ws, **kw):
++            seen.append(kw["extra_context"])
++            ws.write_file(f"src/impl_{len(seen)}.py", "x = 1\n")
++            return AgentRunResult(ok=True, summary="done", steps=1, tool_calls=["write_file"])
++
++    verdicts = [False, True]
++
++    def fake_verify(task, ws, **kw):
++        ok = verdicts.pop(0)
++        return VerificationReport(implementation_present=True, diff_stat="1 file", tests_required=True,
++                                  tests=TestOutcome(command="pytest", ran=True, passed=ok, exit_code=0 if ok else 1,
++                                                    n_passed=1 if ok else 0, n_failed=0 if ok else 1))
++
++    monkeypatch.setattr(tg, "DeveloperAgent", FakeAgent)
++    monkeypatch.setattr(tg, "verify_task", fake_verify)
++    res = tg.run_task(task, workspace_root=str(repo.root), agent_role="backend",
++                      settings=_settings(tmp_path), context=ctx)
++    assert res.ok and res.attempts == 2
++    assert seen[0] == ""
++    assert seen[1].startswith("Earlier attempts on this task:\nAttempt 1 — verify_failed")
++    assert "did NOT pass verification" in seen[1]
++    assert [r.data["outcome"] for r in engine.attempts(ctx.reader)] == ["verify_failed"]
++    engine.close()
++
++
++def test_base_agent_run_is_instrumented(monkeypatch):
++    calls = {}
++
++    class StubContext:
++        def instrument(self, tools):
++            calls["instrument"] = list(tools)
++            return ["wrapped"], "HOOK"
++        def finish_run(self, messages):
++            calls["finished"] = len(messages)
++
++    class FakeGraph:
++        def invoke(self, state, config=None):
++            return {"messages": [*state["messages"], AIMessage(content="Implemented it; tests pass.")]}
++
++    def fake_create(model, tools, **kw):
++        calls["tools"], calls["hook"] = tools, kw.get("pre_model_hook")
++        return FakeGraph()
++
++    monkeypatch.setattr("aamt.agents.base.create_react_agent", fake_create)
++    monkeypatch.setattr(BaseAgent, "_model", lambda self: None)
++    agent = BaseAgent(AgentSpec(role="backend", title="Backend"), context=StubContext())
++    res = agent.run("do it", tools=["t1"])
++    assert calls == {"instrument": ["t1"], "tools": ["wrapped"], "hook": "HOOK", "finished": 3}
++    assert res.summary == "Implemented it; tests pass."
++
++
++def test_orchestrator_briefs_come_from_shared_memory(tmp_path, monkeypatch):
++    plan = BacklogPlan(epic="Task list", features=[PlannedFeature(title="Core", stories=[PlannedStory(
++        title="Store", tasks=[
++            PlannedTask(ref="t1", title="Create store module", description="in-memory store", role="backend",
++                        priority="HIGH", estimate=2, acceptance_criteria=[PlannedCriterion(text="module exists")]),
++            PlannedTask(ref="t2", title="Add tests for store", description="pytest", role="qa", priority="HIGH",
++                        estimate=2, depends_on=["t1"], acceptance_criteria=[PlannedCriterion(text="tests pass")]),
++        ])])])
++    monkeypatch.setattr("aamt.agents.scrum_master.BacklogPlanner.generate", lambda self, project: plan)
++    monkeypatch.setattr("aamt.agents.scrum_master.ScrumMaster._goal_sentence",
++                        lambda self, project, plan: "Deliver the store slice.")
++    seen: dict[str, tuple[str, object]] = {}
++
++    def fake_run_task(task, *, workspace_root, agent_role, **kw):
++        seen[task.title] = (kw["project_summary"], kw["context"])
++        ws = Workspace(workspace_root)
++        ws.ensure_git_repo()
++        ws.create_branch(f"task/{task.id}")
++        ws.write_file(f"src/{task.id}.py", "value = 1\n")
++        ws.commit_all(f"feat: {task.title}")
++        t = task.model_copy(deep=True)
++        t.advance_to(TaskStatus.TESTING, actor=agent_role)
++        t.transition(TaskStatus.DONE, actor=agent_role)
++        commit = ws.last_commit_hash()
++        t.add_evidence(commit=commit, actor=agent_role)
++        return TaskRunResult(task=t, outcome="done", attempts=1, branch=f"task/{task.id}", commit_hash=commit,
++                             events=[{"type": "TASK_COMPLETION_CLAIMED", "payload": {
++                                         "task_id": t.id, "attempt": 1,
++                                         "summary": f"SUMMARY: {task.title} delivered as src/{t.id}.py"}},
++                                     {"type": "TASK_COMPLETED", "payload": {"task_id": t.id, "hash": commit}}])
++
++    monkeypatch.setattr("aamt.orchestrator.orchestrator.run_task", fake_run_task)
++    monkeypatch.setattr("aamt.orchestrator.orchestrator.ReviewerAgent.review", lambda self, task, ws, **kw: __import__(
++        "aamt.integration.reviewer", fromlist=["ReviewResult"]).ReviewResult(approved=True, comments=["ok"]))
++    settings = _settings(tmp_path, enable_standups=False, enable_retro=False, inter_task_seconds=0, max_sprints=3)
++    settings.ensure_dirs()
++    monkeypatch.setattr("aamt.config.get_settings", lambda reload=False: settings)
++
++    from aamt.orchestrator import Orchestrator
++
++    orch = Orchestrator(settings)
++    project = orch.run(name="demo", problem_statement="build a task list store", repo_path=str(tmp_path / "repo"),
++                       acceptance_criteria=["pytest passes"], max_sprints=3)
++    assert project.status.value == "COMPLETED" and orch.context.errors == []
++    first, ctx1 = seen["Create store module"]
++    second, _ = seen["Add tests for store"]
++    assert "build a task list store" in first and "pytest passes" in first      # requirements from memory
++    assert "Create store module delivered" in second                            # upstream handoff
++    assert ctx1.reader.task_id and ctx1.reader.team == "backend"
++    assert (settings.data_dir / "context.db").exists()
++    assert "## Decisions" in (settings.data_dir / "reports" / "decisions.md").read_text(encoding="utf-8")
++    orch.close()
++
++
++def test_context_engine_can_be_switched_off(tmp_path, monkeypatch):
++    settings = _settings(tmp_path, enable_context_engine=False)
++    settings.ensure_dirs()
++    from aamt.orchestrator import Orchestrator
++
++    orch = Orchestrator(settings)
++    assert orch.context is None
++    project = Project(name="p", problem_statement="demo")
++    assert orch._context_for(project, Task(title="t"), None, None) == orch._project_summary(project)
++    orch.close()
