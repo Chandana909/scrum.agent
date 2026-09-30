@@ -1,17 +1,24 @@
 """SQLite persistence for shared memory, channels, working transcripts and blobs.
 
 One database per project (same approach as aamt's ``project_state.db`` / ``events.db``):
-WAL mode, one connection guarded by an RLock, every write committed immediately.
+WAL mode, one connection guarded by an RLock.
 
 Invariants kept here rather than in callers:
 
-* records carry an integer ``version``; :meth:`replace` is compare-and-swap, so two
-  agents updating the same record cannot silently overwrite each other;
+* every write runs in a transaction that takes SQLite's write lock up front
+  (``BEGIN IMMEDIATE``), so read-modify-write steps are atomic across threads *and*
+  processes; :meth:`transaction` groups several writes into one atomic unit and nests
+  (inner blocks become savepoints);
+* records carry an integer ``version``; :meth:`replace` is compare-and-swap and
+  :meth:`mutate` recomputes changes from the current row, so two agents updating the
+  same record can neither overwrite each other nor lose an increment;
 * every record change appends to ``history`` (who, what, when, full snapshot);
 * full-text search (FTS5, BM25) is kept in sync by triggers on content columns only,
   so bumping access counters does not re-index;
 * channel messages get a global ``seq``; each reader keeps its own cursor per channel,
-  so one reader consuming a broadcast never hides it from another.
+  so one reader consuming a broadcast never hides it from another;
+* the schema carries a version (``PRAGMA user_version``); a database written by a newer
+  schema is refused instead of being misread.
 """
 
 from __future__ import annotations
@@ -19,10 +26,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Self
 
 from ._util import Clock, content_hash, dumps, new_id, normalize_entity, system_clock
 from .types import (
@@ -37,6 +44,15 @@ from .types import (
 
 class VersionConflict(RuntimeError):
     """A compare-and-swap update lost a race (the record changed since it was read)."""
+
+
+class SchemaVersionError(RuntimeError):
+    """The database was written by a newer, incompatible version of this package."""
+
+
+SCHEMA_VERSION = 1
+
+Synchronous = Literal["OFF", "NORMAL", "FULL", "EXTRA"]
 
 
 _SCHEMA = """
@@ -161,38 +177,98 @@ def _enum_values(values: Iterable[Any]) -> list[str]:
 
 
 class SqliteMemoryStore:
-    def __init__(self, path: str | Path = ":memory:", *, clock: Clock = system_clock):
+    """Thread-safe (one connection + RLock) and multi-process-safe (WAL + write locks).
+
+    ``synchronous="NORMAL"`` is SQLite's recommended setting for WAL: the database can't
+    be corrupted, but a power cut may lose the last few commits. Pass ``"FULL"`` when
+    every commit must survive a power cut. ``busy_timeout_s`` is how long a writer waits
+    for another process's write lock before raising ``sqlite3.OperationalError``.
+    """
+
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        clock: Clock = system_clock,
+        synchronous: Synchronous = "NORMAL",
+        busy_timeout_s: float = 30.0,
+    ):
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.clock = clock
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._depth = 0
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=busy_timeout_s)
         self._conn.row_factory = sqlite3.Row
         if self.path != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL")
+        if synchronous not in ("OFF", "NORMAL", "FULL", "EXTRA"):
+            raise ValueError(f"synchronous must be OFF, NORMAL, FULL or EXTRA, not {synchronous!r}")
+        self._conn.execute(f"PRAGMA synchronous={synchronous}")
+        found = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if found > SCHEMA_VERSION:
+            self._conn.close()
+            raise SchemaVersionError(
+                f"{self.path} has schema version {found}; this aamt-context supports up to {SCHEMA_VERSION}"
+            )
         self._conn.executescript(_SCHEMA)
         try:
             self._conn.executescript(_FTS)
             self.fts_enabled = True
         except sqlite3.OperationalError:  # SQLite built without FTS5
             self.fts_enabled = False
+        if found < SCHEMA_VERSION:
+            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
 
     # ------------------------------------------------------------------
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
+        """One atomic unit of work. The outermost block takes the write lock
+        (``BEGIN IMMEDIATE``) and commits; nested blocks are savepoints, so an inner
+        failure that the caller handles only undoes the inner block."""
         with self._lock:
+            depth = self._depth
+            if depth == 0:
+                self._conn.execute("BEGIN IMMEDIATE")
+            else:
+                self._conn.execute(f"SAVEPOINT sp{depth}")
+            self._depth = depth + 1
             try:
                 yield self._conn
-                self._conn.commit()
             except BaseException:
-                self._conn.rollback()
+                self._depth = depth
+                if depth == 0:
+                    self._conn.rollback()
+                else:
+                    self._conn.execute(f"ROLLBACK TO sp{depth}")
+                    self._conn.execute(f"RELEASE sp{depth}")
                 raise
+            self._depth = depth
+            if depth == 0:
+                self._conn.commit()
+            else:
+                self._conn.execute(f"RELEASE sp{depth}")
+
+    def transaction(self) -> AbstractContextManager[sqlite3.Connection]:
+        """Group several store calls into one atomic unit (all or nothing)::
+
+            with store.transaction():
+                store.put(new)
+                store.update(old.id, ...)
+        """
+        return self._tx()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     # ------------------------------------------------------------------
     # records
@@ -282,24 +358,43 @@ class SqliteMemoryStore:
             self._history(c, new, op, actor, note)
         return new
 
-    def update(
-        self, record_id: str, *, actor: str, op: str = "update", note: str | None = None,
-        expected_version: int | None = None, retries: int = 3, **changes: Any,
+    def mutate(
+        self,
+        record_id: str,
+        fn: Callable[[MemoryRecord], dict[str, Any] | None],
+        *,
+        actor: str,
+        op: str = "update",
+        note: str | None = None,
+        expected_version: int | None = None,
     ) -> MemoryRecord:
-        """Field-level update. Without ``expected_version`` it retries lost races."""
-        for attempt in range(retries + 1):
+        """Atomic read-modify-write.
+
+        ``fn`` receives the record as it is *now* and returns the fields to change
+        (``None`` or ``{}`` leaves it untouched). The read and the write happen under the
+        write lock, so changes derived from the current value — ``support + 1``, a merged
+        ``data`` dict — can't lose a concurrent writer's update.
+        """
+        with self._tx():
             cur = self.get(record_id)
             if cur is None:
                 raise KeyError(record_id)
             if expected_version is not None and cur.version != expected_version:
                 raise VersionConflict(f"{record_id}: at version {cur.version}, expected {expected_version}")
+            changes = fn(cur)
+            if not changes:
+                return cur
             new = cur.model_copy(update=changes, deep=True)
-            try:
-                return self.replace(new, expected_version=cur.version, actor=actor, op=op, note=note)
-            except VersionConflict:
-                if expected_version is not None or attempt == retries:
-                    raise
-        raise AssertionError("unreachable")
+            return self.replace(new, expected_version=cur.version, actor=actor, op=op, note=note)
+
+    def update(
+        self, record_id: str, *, actor: str, op: str = "update", note: str | None = None,
+        expected_version: int | None = None, **changes: Any,
+    ) -> MemoryRecord:
+        """Set fields to fixed values. For values derived from the current record, use
+        :meth:`mutate`."""
+        return self.mutate(record_id, lambda _cur: changes, actor=actor, op=op, note=note,
+                           expected_version=expected_version)
 
     def query(
         self,
@@ -314,17 +409,22 @@ class SqliteMemoryStore:
         pinned: bool | None = None,
         author: str | None = None,
         as_of: float | None = None,
+        scope_prefix: str | None = None,
         order: str = "updated",
         limit: int | None = None,
     ) -> list[MemoryRecord]:
+        """``scope_prefix`` keeps records at that scope or below it (``p/P-1`` matches
+        ``p/P-1`` and ``p/P-1/task/T-2`` but not ``p/P-10``). ``order="recent"`` is newest
+        created first."""
         where, params = self._filters(
             scopes=scopes, kinds=kinds, statuses=statuses, subject=subject,
             entities_any=entities_any, tags_any=tags_any, sprint_id=sprint_id,
-            pinned=pinned, author=author, as_of=as_of,
+            pinned=pinned, author=author, as_of=as_of, scope_prefix=scope_prefix,
         )
         order_sql = {
             "updated": "updated_at DESC, rid DESC",
             "created": "created_at ASC, rid ASC",
+            "recent": "created_at DESC, rid DESC",
             "importance": "importance DESC, support DESC, updated_at DESC",
         }[order]
         sql = "SELECT * FROM records" + (f" WHERE {' AND '.join(where)}" if where else "")
@@ -339,7 +439,7 @@ class SqliteMemoryStore:
     @staticmethod
     def _filters(
         *, scopes, kinds, statuses, subject=None, entities_any=None, tags_any=None,
-        sprint_id=None, pinned=None, author=None, as_of=None, alias: str = "",
+        sprint_id=None, pinned=None, author=None, as_of=None, scope_prefix=None, alias: str = "",
     ) -> tuple[list[str], list[Any]]:
         p = f"{alias}." if alias else ""
         where: list[str] = []
@@ -350,6 +450,10 @@ class SqliteMemoryStore:
                 return ["0"], []
             where.append(f"{p}scope IN ({_in(scopes)})")
             params += scopes
+        if scope_prefix is not None:
+            # prefix match on the path boundary; substr() avoids LIKE's wildcard escaping
+            where.append(f"({p}scope = ? OR substr({p}scope, 1, ?) = ?)")
+            params += [scope_prefix, len(scope_prefix) + 1, scope_prefix + "/"]
         if kinds is not None:
             ks = _enum_values(kinds)
             where.append(f"{p}kind IN ({_in(ks)})")
@@ -487,6 +591,17 @@ class SqliteMemoryStore:
             return None
         return json.loads(row["vec"])
 
+    def get_vectors(self, digests: dict[str, str]) -> dict[str, list[float]]:
+        """Vectors for ``{record_id: content_hash}`` in one query; stale ones are omitted."""
+        if not digests:
+            return {}
+        ids = list(digests)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT record_id, content_hash, vec FROM vectors WHERE record_id IN ({_in(ids)})", ids
+            ).fetchall()
+        return {r["record_id"]: json.loads(r["vec"]) for r in rows if digests.get(r["record_id"]) == r["content_hash"]}
+
     def put_vector(self, record_id: str, digest: str, vec: Sequence[float]) -> None:
         with self._tx() as c:
             c.execute(
@@ -526,11 +641,11 @@ class SqliteMemoryStore:
         self, channel_id: str, *, meta: dict[str, Any] | None = None, closed_at: float | None = None,
         participants: Sequence[str] | None = None,
     ) -> None:
-        current = self.get_channel(channel_id)
-        if current is None:
-            raise KeyError(channel_id)
-        merged = {**current["meta"], **(meta or {})}
-        with self._tx() as c:
+        with self._tx() as c:   # read inside the write lock: concurrent meta merges can't lose keys
+            current = self.get_channel(channel_id)
+            if current is None:
+                raise KeyError(channel_id)
+            merged = {**current["meta"], **(meta or {})}
             c.execute(
                 "UPDATE channels SET meta = ?, closed_at = COALESCE(?, closed_at), participants = ? WHERE id = ?",
                 (dumps(merged), closed_at, dumps(list(participants if participants is not None
@@ -538,15 +653,20 @@ class SqliteMemoryStore:
             )
 
     def post_message(self, msg: ChannelMessage) -> ChannelMessage:
+        """Append ``msg``. Idempotent by ``msg.id``: re-posting an id returns the stored message."""
         with self._tx() as c:
             cur = c.execute(
                 "INSERT INTO channel_messages (id, channel, sender, recipients, type, content, data, "
-                "related, reply_to, ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "related, reply_to, ts) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
                 (msg.id, msg.channel, msg.sender, dumps(msg.recipients), msg.type, msg.content,
                  dumps(msg.data), dumps(msg.related), msg.reply_to, msg.ts),
             )
-            seq = int(cur.lastrowid)
-        return msg.model_copy(update={"seq": seq})
+            if cur.rowcount == 1 and cur.lastrowid is not None:
+                return msg.model_copy(update={"seq": int(cur.lastrowid)})
+        existing = self.get_message(msg.id)
+        if existing is None:  # pragma: no cover - the conflicting row can't vanish under the write lock
+            raise RuntimeError(f"message {msg.id} was neither inserted nor found")
+        return existing
 
     @staticmethod
     def _msg_from_row(row: sqlite3.Row) -> ChannelMessage:
@@ -592,16 +712,14 @@ class SqliteMemoryStore:
     # working-context items (transcripts, condensations, edits, manifests)
     # ------------------------------------------------------------------
     def append_ctx(self, session_id: str, kind: str, item_id: str, payload: dict[str, Any]) -> int:
-        with self._tx() as c:
-            row = c.execute(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM ctx_items WHERE session_id = ?", (session_id,)
-            ).fetchone()
-            seq = int(row[0])
+        with self._tx() as c:   # the write lock makes MAX(seq)+1 and the insert one step
             c.execute(
-                "INSERT INTO ctx_items (session_id, seq, kind, item_id, payload, ts) VALUES (?,?,?,?,?,?)",
-                (session_id, seq, kind, item_id, dumps(payload), self.clock()),
+                "INSERT INTO ctx_items (session_id, seq, kind, item_id, payload, ts) "
+                "SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ? FROM ctx_items WHERE session_id = ?",
+                (session_id, kind, item_id, dumps(payload), self.clock(), session_id),
             )
-        return seq
+            row = c.execute("SELECT MAX(seq) FROM ctx_items WHERE session_id = ?", (session_id,)).fetchone()
+        return int(row[0])
 
     def ctx_items(self, session_id: str, *, kinds: Sequence[str] | None = None) -> list[dict[str, Any]]:
         sql = "SELECT seq, kind, item_id, payload, ts FROM ctx_items WHERE session_id = ?"
@@ -646,3 +764,13 @@ class SqliteMemoryStore:
         with self._tx() as c:
             cur = c.execute("INSERT OR IGNORE INTO processed (key, ts) VALUES (?, ?)", (key, self.clock()))
             return cur.rowcount == 1
+
+    def is_claimed(self, key: str) -> bool:
+        with self._lock:
+            return self._conn.execute("SELECT 1 FROM processed WHERE key = ?", (key,)).fetchone() is not None
+
+    def blob_session(self, blob_id: str) -> str | None:
+        """The session a stored output belongs to (``None`` if unknown or unowned)."""
+        with self._lock:
+            row = self._conn.execute("SELECT session_id FROM blobs WHERE id = ?", (blob_id,)).fetchone()
+        return row["session_id"] if row else None

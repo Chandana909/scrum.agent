@@ -42,20 +42,22 @@ def stable_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-STOPWORDS = frozenset(
-    """a an and are as at be but by can do does for from has have if in into is it its
-    of on or should that the their then there these this to was we were will with you your
-    must not no yes all any each when which who what how why also use using used via per""".split()
-)
+STOPWORDS = frozenset([
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "does", "for", "from",
+    "has", "have", "if", "in", "into", "is", "it", "its", "of", "on", "or", "should", "that",
+    "the", "their", "then", "there", "these", "this", "to", "was", "we", "were", "will", "with",
+    "you", "your", "must", "not", "no", "yes", "all", "any", "each", "when", "which", "who",
+    "what", "how", "why", "also", "use", "using", "used", "via", "per",
+])
 
-_TERM = re.compile(r"[a-z0-9]+")
+_TERM = re.compile(r"[^\W_]+")   # letters and digits in any script
 
 
 def terms(text: str, *, min_len: int = 2) -> list[str]:
     """Lowercase alphanumeric terms without stopwords, order-preserving and de-duplicated.
 
     Splits on everything else (including ``/`` ``.`` ``_``), which matches how SQLite's
-    ``unicode61`` FTS tokenizer indexes the same text.
+    ``unicode61`` FTS tokenizer indexes the same text, in any script (``café``, ``日本``).
     """
     seen: set[str] = set()
     out: list[str] = []

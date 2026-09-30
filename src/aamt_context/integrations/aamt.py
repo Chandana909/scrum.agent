@@ -18,6 +18,7 @@ aamt (aamt's events, tasks and stores are only touched through their attributes)
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 from collections.abc import Callable, Sequence
@@ -31,6 +32,8 @@ from ..channels import Channels
 from ..engine import ContextEngine, ReaderContext
 from ..session import ContextSession
 from ..types import ChannelMessage, MemoryKind, MemoryStatus, Scope
+
+logger = logging.getLogger(__name__)
 
 _TASK_ID = re.compile(r"\bT-[a-z0-9]{3,}\b")
 OPERATIONAL_CONTEXTS = ("reporting", "resume")
@@ -61,7 +64,7 @@ class AamtContextBridge:
         # When the task graph passes an AamtTaskContext it records rich attempts itself;
         # set False then, so AGENT_FAILED / failed TASK_VERIFIED events don't add thin duplicates.
         self.attempts_from_events = attempts_from_events
-        self.errors: list[tuple[str, str]] = []
+        self.errors: list[tuple[str, str]] = []   # recent ingestion failures (last 1000)
         self._project_id: str | None = None
         self._synced_project = False
 
@@ -76,15 +79,24 @@ class AamtContextBridge:
         return bus.subscribe(self.ingest_event)
 
     def ingest_event(self, event: Any) -> bool:
+        """Turn one aamt event into memory. Returns True if it was handled now.
+
+        The event is marked processed only after its handler succeeds, so a failure (a
+        locked database, a bug) is retried when the event is delivered again. Handlers
+        are idempotent: their writes carry ``source_key``s derived from the event id.
+        """
         handler = getattr(self, f"_on_{_etype(event).lower()}", None)
-        if handler is None or not self.engine.store.claim(f"event:{event.id}"):
+        key = f"event:{event.id}"
+        if handler is None or self.engine.store.is_claimed(key):
             return False
         try:
             handler(event, dict(getattr(event, "payload", None) or {}))
-            return True
-        except Exception as exc:  # noqa: BLE001 - never break the producer
+        except Exception as exc:  # never break the producer; the event stays retryable
+            logger.exception("aamt event %s (%s) could not be ingested", event.id, _etype(event))
             self.errors.append((event.id, f"{type(exc).__name__}: {exc}"))
+            del self.errors[:-1_000]
             return False
+        return self.engine.store.claim(key)
 
     # --------------------------------------------------------------- helpers
     def _pid(self, event: Any = None) -> str | None:
@@ -116,7 +128,7 @@ class AamtContextBridge:
         try:
             res = subprocess.run(
                 ["git", "-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r", commit],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=15, check=False,
             )
         except (OSError, subprocess.SubprocessError):
             return []
@@ -184,18 +196,22 @@ class AamtContextBridge:
         low = ctx.lower()
         if not decision or low in OPERATIONAL_CONTEXTS or low.startswith("carry-forward"):
             return
-        common = dict(author=author or self.curator, sprint_id=sprint_id, entities=list(related),
-                      source_key=source_key, source_events=list(source_events))
-        scope = Scope.project(pid)
+
+        def remember(kind: MemoryKind, title: str, *, body: str = "", tags: Sequence[str] = (),
+                     data: dict[str, Any] | None = None) -> None:
+            self.memory.remember(
+                scope=Scope.project(pid), kind=kind, title=title, body=body, tags=tags, data=data,
+                author=author or self.curator, sprint_id=sprint_id, entities=list(related),
+                source_key=source_key, source_events=list(source_events),
+            )
+
         if low == "replanning":
-            self.memory.remember(scope=scope, kind=MemoryKind.FACT, title=decision, tags=["replanning"], **common)
+            remember(MemoryKind.FACT, decision, tags=["replanning"])
         elif low.startswith("sprint") and "planning" in low:
-            self.memory.remember(scope=scope, kind=MemoryKind.SUMMARY, title=f"{ctx}: {decision}",
-                                 body=reason or "", tags=["sprint-plan"], **common)
+            remember(MemoryKind.SUMMARY, f"{ctx}: {decision}", body=reason or "", tags=["sprint-plan"])
         else:
-            self.memory.remember(scope=scope, kind=MemoryKind.DECISION, title=decision,
-                                 body=f"Context: {ctx}" if ctx else "",
-                                 data={"rationale": reason or None, "context": ctx}, **common)
+            remember(MemoryKind.DECISION, decision, body=f"Context: {ctx}" if ctx else "",
+                     data={"rationale": reason or None, "context": ctx})
 
     def _on_project_created(self, e: Any, p: dict[str, Any]) -> None:
         self._pid(e)
@@ -393,7 +409,7 @@ class AamtContextBridge:
             return
         ChannelMailbox(self.engine, pid, sender).send(
             str(p.get("recipient", "broadcast")), str(p.get("type", "MESSAGE")), str(p["content"]),
-            related_tasks=p.get("related_tasks") or [],
+            related_tasks=p.get("related_tasks") or [], message_id=f"CM-{e.id}",   # replay-safe
         )
 
     # ---------------------------------------------------------------- briefs
@@ -512,12 +528,14 @@ class ChannelMailbox:
     def channels(self) -> list[str]:
         return self.engine.channels.subscriptions(project_id=self.project_id, agent_id=self.agent_id, team=self.team)
 
-    def send(self, recipient: str, type: str, content: str, *, related_tasks: Sequence[str] | None = None) -> ChannelMessage:
+    def send(self, recipient: str, type: str, content: str, *, related_tasks: Sequence[str] | None = None,
+             message_id: str | None = None) -> ChannelMessage:
         hub = self.engine.channels
         if recipient == "broadcast":
             return hub.post(Channels.project(self.project_id), self.agent_id, content, type=type,
-                            related=related_tasks or [])
-        return hub.send(self.agent_id, recipient, content, type=type, related=related_tasks or [])
+                            related=related_tasks or [], message_id=message_id)
+        return hub.send(self.agent_id, recipient, content, type=type, related=related_tasks or [],
+                        message_id=message_id)
 
     def broadcast(self, type: str, content: str, **kw: Any) -> ChannelMessage:
         return self.send("broadcast", type, content, **kw)

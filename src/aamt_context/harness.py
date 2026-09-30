@@ -17,15 +17,18 @@ the same session into LangGraph's prebuilt agent — but it is the reference for
 from __future__ import annotations
 
 import inspect
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, overload
 
 from pydantic import BaseModel, Field
 
 from ._util import new_id
 from .session import ContextSession
 from .worklog import Entry, ToolCall
+
+logger = logging.getLogger(__name__)
 
 
 class ToolSpec(BaseModel):
@@ -55,16 +58,36 @@ class Tool:
 
 
 _JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
+_JSON_TYPE_NAMES = {t.__name__: v for t, v in _JSON_TYPES.items()}
 
 
-def tool(fn: Callable[..., Any] | None = None, *, name: str | None = None, description: str | None = None):
+def _json_type(annotation: Any) -> str:
+    # modules with `from __future__ import annotations` hand us strings ("int") rather than types
+    if isinstance(annotation, str):
+        return _JSON_TYPE_NAMES.get(annotation.strip(), "string")
+    return _JSON_TYPES.get(annotation, "string")
+
+
+@overload
+def tool(fn: Callable[..., Any], *, name: str | None = None, description: str | None = None) -> Tool: ...
+
+
+@overload
+def tool(
+    fn: None = None, *, name: str | None = None, description: str | None = None,
+) -> Callable[[Callable[..., Any]], Tool]: ...
+
+
+def tool(
+    fn: Callable[..., Any] | None = None, *, name: str | None = None, description: str | None = None,
+) -> Tool | Callable[[Callable[..., Any]], Tool]:
     """Make a :class:`Tool` from a plain function with simple typed parameters."""
 
     def build(f: Callable[..., Any]) -> Tool:
         props: dict[str, Any] = {}
         required: list[str] = []
         for p in inspect.signature(f).parameters.values():
-            props[p.name] = {"type": _JSON_TYPES.get(p.annotation, "string")}
+            props[p.name] = {"type": _json_type(p.annotation)}
             if p.default is inspect.Parameter.empty:
                 required.append(p.name)
         spec = ToolSpec(
@@ -130,8 +153,8 @@ class AgentLoop:
         if self.on_event is not None:
             try:
                 self.on_event(LoopEvent(step=step, kind=kind, detail=detail))
-            except Exception:  # noqa: BLE001 - observers must not break the loop
-                pass
+            except Exception:  # observers must not break the loop
+                logger.warning("loop event observer failed on %s", kind, exc_info=True)
 
     def run(self, user: str, *, system: str | None = None) -> LoopResult:
         if system:

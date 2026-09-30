@@ -15,7 +15,7 @@ import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from ._util import Clock, clip_chars
+from ._util import Clock, clip_chars, new_id
 from .store import SqliteMemoryStore
 from .types import BROADCAST, ChannelMessage
 
@@ -67,25 +67,30 @@ class ChannelHub:
         data: dict[str, Any] | None = None,
         related: Iterable[str] = (),
         reply_to: str | None = None,
+        message_id: str | None = None,
     ) -> ChannelMessage:
-        info = self.store.get_channel(channel) or self.ensure(channel)
-        if info.get("closed_at"):
-            raise ChannelClosed(f"channel {channel} is closed")
-        msg = ChannelMessage(
-            channel=channel, sender=sender, recipients=list(recipients) or [BROADCAST], type=type,
-            content=content, data=dict(data or {}), related=list(related), reply_to=reply_to,
-            ts=self.clock(),
-        )
-        return self.store.post_message(msg)
+        """Append a message. Pass a deterministic ``message_id`` (e.g. derived from the host
+        event) to make re-posting after a crash or replay a no-op."""
+        with self.store.transaction():   # the closed-check and the append are one step
+            info = self.store.get_channel(channel) or self.ensure(channel)
+            if info.get("closed_at"):
+                raise ChannelClosed(f"channel {channel} is closed")
+            msg = ChannelMessage(
+                channel=channel, sender=sender, recipients=list(recipients) or [BROADCAST], type=type,
+                content=content, data=dict(data or {}), related=list(related), reply_to=reply_to,
+                ts=self.clock(), id=message_id or new_id("CM"),
+            )
+            return self.store.post_message(msg)
 
     def send(
         self, sender: str, recipient: str, content: str, *, type: str = "MESSAGE",
         data: dict[str, Any] | None = None, related: Iterable[str] = (), reply_to: str | None = None,
+        message_id: str | None = None,
     ) -> ChannelMessage:
         """Direct message into ``recipient``'s inbox channel."""
         return self.post(
             Channels.inbox(recipient), sender, content, type=type, recipients=[recipient],
-            data=data, related=related, reply_to=reply_to,
+            data=data, related=related, reply_to=reply_to, message_id=message_id,
         )
 
     def history(self, channel: str, *, after_seq: int = 0, limit: int | None = None) -> list[ChannelMessage]:

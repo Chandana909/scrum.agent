@@ -110,12 +110,13 @@ class ContextSession:
         return len(view)
 
     def condense(self, *, force: bool = False, focus: str | None = None) -> list[str]:
+        store = self.store
         ctx = CondenseContext(
             counter=self.counter, budget=self.budget, llm=self.llm, protected=self._protected(),
             force=force, focus=focus, goal=self.goal,
-            blob_sink=(lambda name, text: self.store.put_blob(text, session_id=self.session_id,
-                                                              meta={"tool": name, "masked": True}))
-            if self.store is not None else None,
+            blob_sink=(lambda name, text: store.put_blob(text, session_id=self.session_id,
+                                                         meta={"tool": name, "masked": True}))
+            if store is not None else None,
         )
         applied = self.pipeline.condense(self.log, ctx)
         self.applied += applied
@@ -134,7 +135,13 @@ class ContextSession:
         return view_tokens(self.log.entries, self.counter)
 
     def read_stored_output(self, blob_id: str, *, offset: int = 0, length: int = 6_000) -> str:
-        return self.clipper.read(blob_id, offset=offset, length=length)
+        """Page through an output this session stored. Outputs owned by other sessions
+        (other agents' tool results) are reported as unknown."""
+        if self.store is not None:
+            owner = self.store.blob_session(blob_id)
+            if owner is not None and owner != self.session_id:
+                return f"ERROR: unknown blob_id {blob_id!r}"
+        return self.clipper.read(blob_id, offset=int(offset), length=int(length))
 
     def stats(self) -> dict[str, Any]:
         return {

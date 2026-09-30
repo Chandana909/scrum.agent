@@ -116,7 +116,7 @@ def test_codemap_ranks_relevant_files(tmp_path):
     assert ".venv/junk.py" not in cm.files()
     ranked = [p for p, _ in cm.rank("add rate limiting to the login endpoint")]
     assert ranked[0] == "src/auth.py"
-    assert [p for p, _ in cm.rank("anything", hints=["src/tasks.py"])][0] == "src/tasks.py"
+    assert next(p for p, _ in cm.rank("anything", hints=["src/tasks.py"])) == "src/tasks.py"
     text, shown = cm.render("login", 200)
     assert shown[0] == "src/auth.py" and "def login(username, password)" in text
     assert "of 3 files" in text

@@ -5,16 +5,16 @@ from typing import Any
 import pytest
 
 pytest.importorskip("langgraph")
-from langchain_core.language_models.chat_models import BaseChatModel  # noqa: E402
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage  # noqa: E402
-from langchain_core.outputs import ChatGeneration, ChatResult  # noqa: E402
-from langchain_core.tools import tool as lc_tool  # noqa: E402
-from pydantic import Field  # noqa: E402
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool as lc_tool
+from pydantic import Field
 
-from aamt_context.config import BudgetConfig  # noqa: E402
-from aamt_context.engine import ContextEngine, ReaderContext  # noqa: E402
-from aamt_context.harness import AgentLoop  # noqa: E402
-from aamt_context.integrations.langchain import (  # noqa: E402
+from aamt_context.config import BudgetConfig
+from aamt_context.engine import ContextEngine, ReaderContext
+from aamt_context.harness import AgentLoop
+from aamt_context.integrations.langchain import (
     LangChainChatModel,
     LangChainTextLLM,
     entries_from_messages,
@@ -24,9 +24,9 @@ from aamt_context.integrations.langchain import (  # noqa: E402
     tool_from_langchain,
     wrap_tools,
 )
-from aamt_context.session import ContextSession  # noqa: E402
-from aamt_context.types import MemoryKind, Scope  # noqa: E402
-from aamt_context.worklog import EntryKind  # noqa: E402
+from aamt_context.session import ContextSession
+from aamt_context.types import MemoryKind, Scope
+from aamt_context.worklog import EntryKind
 
 BUDGET = BudgetConfig(window_tokens=4_000, reserve_output_tokens=500, tool_schema_tokens=0,
                       max_tool_result_tokens=400, keep_last_tool_results=2)

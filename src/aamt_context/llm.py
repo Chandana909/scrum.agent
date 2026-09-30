@@ -10,9 +10,12 @@ retros).
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
 
 
 class LLMUnavailable(RuntimeError):
@@ -62,9 +65,13 @@ def complete_json(
         return None
     try:
         data = extract_json(llm.complete(system, prompt, max_tokens=max_tokens))
-    except Exception:  # noqa: BLE001 - callers fall back deterministically
+    except Exception:  # callers fall back deterministically
+        logger.warning("LLM call failed; using the deterministic fallback", exc_info=True)
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        logger.info("LLM reply had no JSON object; using the deterministic fallback")
+        return None
+    return data
 
 
 def complete_text(
@@ -74,6 +81,7 @@ def complete_text(
         return None
     try:
         text = llm.complete(system, prompt, max_tokens=max_tokens)
-    except Exception:  # noqa: BLE001
+    except Exception:  # callers fall back deterministically
+        logger.warning("LLM call failed; using the deterministic fallback", exc_info=True)
         return None
     return text.strip() or None

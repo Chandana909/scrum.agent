@@ -14,12 +14,11 @@ from aamt_context.types import (
 
 
 def _rec(**kw) -> MemoryRecord:
-    base = dict(
-        scope=Scope.project("P1"), kind=MemoryKind.DECISION, title="Use REST for the public API",
-        body="gRPC is not needed yet", provenance=Provenance(author="scrum-master"),
-    )
-    base.update(kw)
-    return MemoryRecord(**base)
+    base = {
+        "scope": Scope.project("P1"), "kind": MemoryKind.DECISION, "title": "Use REST for the public API",
+        "body": "gRPC is not needed yet", "provenance": Provenance(author="scrum-master"),
+    }
+    return MemoryRecord(**{**base, **kw})
 
 
 def test_roundtrip_preserves_fields(store):

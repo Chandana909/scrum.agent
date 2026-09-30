@@ -18,7 +18,7 @@ _PATH_KEYS = ("path", "file_path", "filepath", "filename", "file", "target", "ol
 _ERR_LINE = re.compile(
     r"(Traceback \(most recent call last\)|\b[A-Za-z_]*(?:Error|Exception)\b|^FAILED\b|^ERROR\b|^E {2,}\S|exit=[1-9]\d*|TIMED_OUT|\bSyntaxError\b)"
 )
-_FAILED_TEST = re.compile(r"^(?:FAILED|ERROR)\s+(\S+::\S+|\S+\.py)", re.M)
+_FAILED_TEST = re.compile(r"^(?:FAILED|ERROR)\s+(\S+::\S+|\S+\.py)", re.MULTILINE)
 
 
 def _uniq(items: Sequence[str]) -> list[str]:

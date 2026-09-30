@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -28,6 +29,8 @@ from ..memory import render_index_line, render_record
 from ..session import ContextSession
 from ..types import MemoryKind, Scope
 from ..worklog import Entry, EntryKind, ToolCall
+
+logger = logging.getLogger(__name__)
 
 CHECKPOINT_NAME = "context_checkpoint"
 
@@ -196,8 +199,8 @@ class LangChainTextLLM:
         model = self.model
         try:
             model = model.bind(max_tokens=max_tokens)
-        except Exception:  # noqa: BLE001 - not every model takes max_tokens
-            pass
+        except Exception:  # not every model takes max_tokens; call it unbounded
+            logger.debug("model %r does not accept max_tokens", type(model).__name__, exc_info=True)
         resp = model.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
         return message_text(resp.content)
 

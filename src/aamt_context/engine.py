@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from ._util import Clock, first_line, new_id
 from .assembly import AssembledContext, ContextAssembler, Item, ListSection, Section, TextSection, Tier
@@ -33,7 +33,7 @@ from .memory import Embedder, SharedMemory, WritePolicy
 from .session import ContextSession
 from .store import SqliteMemoryStore
 from .tokens import TokenCounter, default_counter
-from .types import MemoryKind, MemoryRecord, MemoryStatus, Scope, Visibility, WriteResult
+from .types import MemoryKind, MemoryRecord, MemoryStatus, Scope, Visibility, WriteAction, WriteResult
 
 
 @dataclass
@@ -120,6 +120,12 @@ class ContextEngine:
     def close(self) -> None:
         self.store.close()
 
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
     # ------------------------------------------------------ working context
     def session(
         self, session_id: str, *, budget: BudgetConfig | None = None, goal: str | None = None,
@@ -137,8 +143,13 @@ class ContextEngine:
             cm = self._codemaps[root] = CodeMap(root)
         return cm
 
-    def latest_handoff(self, task_id: str) -> MemoryRecord | None:
-        hits = self.store.query(kinds=[MemoryKind.HANDOFF], subject=f"handoff:{task_id}", limit=1)
+    def latest_handoff(self, task_id: str, *, project_id: str | None = None) -> MemoryRecord | None:
+        """The active handoff of ``task_id``. Pass ``project_id`` whenever one database holds
+        several projects: task ids are only unique within a project."""
+        hits = self.store.query(
+            kinds=[MemoryKind.HANDOFF], subject=f"handoff:{task_id}", limit=1,
+            scope_prefix=Scope.project(project_id) if project_id else None,
+        )
         return hits[0] if hits else None
 
     def build_brief(
@@ -173,9 +184,9 @@ class ContextEngine:
 
         # this task's own history: failed attempts, review/integration feedback, blockers
         if reader.scope:
-            attempts = self.store.query(scopes=[reader.scope], kinds=[MemoryKind.ATTEMPT], order="created")[-3:]
-            feedback = self.store.query(scopes=[reader.scope], kinds=[MemoryKind.FACT], order="created",
-                                        tags_any=["review", "integration", "verification"])[-4:]
+            attempts = self.store.query(scopes=[reader.scope], kinds=[MemoryKind.ATTEMPT], order="recent", limit=3)[::-1]
+            feedback = self.store.query(scopes=[reader.scope], kinds=[MemoryKind.FACT], order="recent", limit=4,
+                                        tags_any=["review", "integration", "verification"])[::-1]
             blockers = self.store.query(scopes=[reader.scope], kinds=[MemoryKind.BLOCKER])
             hist = [Item(r.body or r.title, r.id) for r in (*attempts, *feedback)]
             hist += [Item(f"- BLOCKER: {r.title}", r.id) for r in blockers]
@@ -190,7 +201,7 @@ class ContextEngine:
         upstream: list[Item] = []
         upstream_files: list[str] = []
         for dep in brief.dependencies:
-            h = self.latest_handoff(dep)
+            h = self.latest_handoff(dep, project_id=reader.project_id)
             if h is None:
                 upstream.append(Item(f"- {dep}: no handoff recorded yet — inspect the repository"))
                 continue
@@ -286,15 +297,17 @@ class ContextEngine:
 
         assembled = self.assembler.assemble(sections, budget)
         record_ids = [i for i in assembled.record_ids if i.startswith("MR-")]
-        self.store.touch(record_ids)
-        if ack_inbox and inbox:
-            shown_msgs = set(assembled.section("inbox").record_ids) if assembled.section("inbox") else set()
-            self.channels.ack(reader.agent_id, [m for m in inbox if m.id in shown_msgs])
-        if persist_manifest:
-            self.store.append_ctx(
-                f"brief:{reader.task_id or reader.agent_id or 'adhoc'}", "manifest", new_id("MF"),
-                {**assembled.manifest(), "reader": reader.__dict__, "query": query[:500], "entities": ents},
-            )
+        with self.store.transaction():   # one commit for the brief's bookkeeping
+            self.store.touch(record_ids)
+            inbox_section = assembled.section("inbox")
+            if ack_inbox and inbox and reader.agent_id and inbox_section is not None:
+                shown_msgs = set(inbox_section.record_ids)
+                self.channels.ack(reader.agent_id, [m for m in inbox if m.id in shown_msgs])
+            if persist_manifest:
+                self.store.append_ctx(
+                    f"brief:{reader.task_id or reader.agent_id or 'adhoc'}", "manifest", new_id("MF"),
+                    {**assembled.manifest(), "reader": reader.__dict__, "query": query[:500], "entities": ents},
+                )
         return assembled
 
     # ------------------------------------------------- handoffs & attempts
@@ -321,40 +334,48 @@ class ContextEngine:
         self, report: HandoffReport, reader: ReaderContext, *, source_key: str | None = None,
         announce: bool = True,
     ) -> list[WriteResult]:
-        """Persist a child's report; its decisions/interfaces become proposals for the lead."""
+        """Persist a child's report; its decisions/interfaces become proposals for the lead.
+
+        Atomic (all records and announcements, or none) and, with ``source_key``,
+        replay-safe: recording the same report again returns the stored handoff without
+        re-adding its decisions or re-announcing its contracts.
+        """
         scope = reader.scope or Scope.task(reader.project_id, report.task_id)
         shared = Scope.team(reader.project_id, reader.team) if reader.team else Scope.project(reader.project_id)
         project = Scope.project(reader.project_id)
         author, role, sprint = report.agent, reader.role, reader.sprint_id
         entities = [report.task_id, *report.files_changed]
-        results = [self.memory.remember(
-            scope=scope, kind=MemoryKind.HANDOFF, author=author, role=role,
-            subject=f"handoff:{report.task_id}", title=f"{report.task_id}: {first_line(report.summary or report.outcome, 140)}",
-            body=report.render(), data=report.model_dump(), entities=entities, sprint_id=sprint,
-            source_key=source_key,
-        )]
-        common = dict(author=author, role=role, entities=entities, sprint_id=sprint,
-                      data={"from_handoff": report.task_id})
-        for d in report.decisions:
-            results.append(self.memory.remember(scope=shared, kind=MemoryKind.DECISION, title=d, **common))
-        for c in report.interfaces:
-            results.append(self.memory.remember(scope=project, kind=MemoryKind.CONTRACT, title=c, **common))
-            if announce:
-                self.channels.post(Channels.project(reader.project_id), author, c, type="API_CONTRACT_UPDATE",
-                                   related=[report.task_id])
-        for a in report.assumptions:
-            results.append(self.memory.remember(scope=shared, kind=MemoryKind.ASSUMPTION, title=a, **common))
-        for q in report.open_questions:
-            results.append(self.memory.remember(
-                scope=shared, kind=MemoryKind.CLARIFICATION, title=q, tags=["open-question"],
-                **{**common, "data": {"question": q, "open": True, "from_handoff": report.task_id}},
-            ))
-        for f in report.follow_ups:
-            results.append(self.memory.remember(scope=project, kind=MemoryKind.ACTION_ITEM, title=f,
-                                                tags=["follow-up"], **common))
-        for r in report.risks:
-            results.append(self.memory.remember(scope=shared, kind=MemoryKind.RISK, title=r, **common))
-        return results
+
+        def remember(scope: str, kind: MemoryKind, title: str, *, tags: Sequence[str] = (),
+                     data: dict[str, Any] | None = None) -> WriteResult:
+            return self.memory.remember(
+                scope=scope, kind=kind, title=title, author=author, role=role, entities=entities,
+                sprint_id=sprint, tags=tags, data={"from_handoff": report.task_id, **(data or {})},
+            )
+
+        with self.store.transaction():
+            handoff = self.memory.remember(
+                scope=scope, kind=MemoryKind.HANDOFF, author=author, role=role,
+                subject=f"handoff:{report.task_id}",
+                title=f"{report.task_id}: {first_line(report.summary or report.outcome, 140)}",
+                body=report.render(), data=report.model_dump(), entities=entities, sprint_id=sprint,
+                source_key=source_key,
+            )
+            if source_key and handoff.action is WriteAction.DUPLICATE and handoff.record.source_key == source_key:
+                return [handoff]   # already recorded: a replay must not reinforce or re-announce
+            results = [handoff]
+            results += [remember(shared, MemoryKind.DECISION, d) for d in report.decisions]
+            for c in report.interfaces:
+                results.append(remember(project, MemoryKind.CONTRACT, c))
+                if announce:
+                    self.channels.post(Channels.project(reader.project_id), author, c, type="API_CONTRACT_UPDATE",
+                                       related=[report.task_id])
+            results += [remember(shared, MemoryKind.ASSUMPTION, a) for a in report.assumptions]
+            results += [remember(shared, MemoryKind.CLARIFICATION, q, tags=["open-question"],
+                                 data={"question": q, "open": True}) for q in report.open_questions]
+            results += [remember(project, MemoryKind.ACTION_ITEM, f, tags=["follow-up"]) for f in report.follow_ups]
+            results += [remember(shared, MemoryKind.RISK, r) for r in report.risks]
+            return results
 
     def proposals(self, visibility: Visibility) -> list[MemoryRecord]:
         """Everything awaiting a curator (Scrum Master / human) decision."""

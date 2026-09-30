@@ -243,7 +243,7 @@ class MemoryRecord(BaseModel):
     access_count: int = 0
     last_accessed_at: float | None = None
 
-    def model_post_init(self, __context: Any) -> None:
+    def model_post_init(self, context: Any, /) -> None:
         self.entities = sorted({normalize_entity(e) for e in self.entities if e})
         self.tags = sorted({t.strip().lower() for t in self.tags if t and t.strip()})
         if not self.content_hash:

@@ -114,15 +114,28 @@ git apply ../scrum/integration/aamt-context.patch
 ## Development
 
 ```bash
-uv sync
+uv sync --locked
+```
+
+```bash
+uv run ruff check src tests docs/spikes
+```
+
+```bash
+uv run pyright
 ```
 
 ```bash
 uv run pytest
 ```
 
-The dev group installs LangChain/LangGraph and aamt itself (pinned to the patched commit) so the
-integration tests run against the real host code. 82 tests; no API keys or network needed.
+The dev group installs LangChain/LangGraph and aamt itself, pinned to the patched commit, so the
+integration tests run against the real host code. There are 97 tests, and none needs an API key or
+network access.
+
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs lint, type check and tests on Linux and
+Windows with Python 3.11 and 3.12. It also applies the patch to aamt and runs aamt's own test suite.
+Integration steps are in [TASKS.md](TASKS.md); changes are in [CHANGELOG.md](CHANGELOG.md).
 
 If this folder is synced by OneDrive/Dropbox, keep the virtualenv outside it by setting
 `UV_PROJECT_ENVIRONMENT` to a local path before `uv sync`.
@@ -135,6 +148,9 @@ src/aamt_context/     core (types, store, memory, channels, meetings, lessons, a
 src/aamt_context/integrations/   langchain.py, aamt.py
 tests/                unit + LangGraph/LangChain + real-aamt integration tests
 integration/          aamt-context.patch (verified against aamt 516a4be)
+TASKS.md              step-by-step integration plan (owners, changes, done-when)
+CHANGELOG.md          what changed per version
+.github/workflows/    CI: lint, types, tests, and the aamt patch check
 docs/                 the design notes — start at docs/README.md
 docs/spikes/          reproducible checks behind docs/08 (co-install resolution, middleware, vectors, repo map)
 ```

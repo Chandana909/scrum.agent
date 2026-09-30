@@ -34,7 +34,7 @@ from .types import (
 )
 from .worklog import Entry, EntryKind, ToolCall, WorkingLog
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "AgentLoop", "AssembledContext", "AttemptSummary", "BudgetConfig", "ChannelHub", "ChannelMessage",

@@ -19,6 +19,7 @@ half-life), scope proximity and optional embedding similarity.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -41,6 +42,8 @@ from .types import (
     WriteResult,
     kind_policy,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +222,27 @@ class SharedMemory:
         supersedes: str | None = None,
         status: MemoryStatus | str | None = None,
     ) -> WriteResult:
-        kind = MemoryKind(kind)
+        """Write one record, applying idempotency, policy, de-duplication and supersession.
+
+        The whole decision runs in one store transaction: the idempotency check, the new
+        record and the retirement of what it supersedes land together or not at all.
+        """
+        with self.store.transaction():
+            return self._remember(
+                scope=scope, kind=MemoryKind(kind), title=title, author=author, body=body, role=role,
+                data=data, subject=subject, tags=tags, entities=entities, importance=importance,
+                confidence=confidence, pinned=pinned, trust=trust, sprint_id=sprint_id,
+                source_key=source_key, source_events=source_events, source_ref=source_ref,
+                supersedes=supersedes, status=status,
+            )
+
+    def _remember(
+        self, *, scope: str, kind: MemoryKind, title: str, author: str, body: str, role: str | None,
+        data: dict[str, Any] | None, subject: str | None, tags: Iterable[str], entities: Iterable[str],
+        importance: float | None, confidence: float, pinned: bool, trust: Trust | str | None,
+        sprint_id: str | None, source_key: str | None, source_events: Iterable[str], source_ref: str | None,
+        supersedes: str | None, status: MemoryStatus | str | None,
+    ) -> WriteResult:
         if source_key:
             existing = self.store.get_by_source_key(source_key)
             if existing is not None:
@@ -283,21 +306,23 @@ class SharedMemory:
         return WriteResult(action, rec)
 
     def _reinforce(self, existing: MemoryRecord, new: MemoryRecord) -> MemoryRecord:
-        seen_by = sorted({*existing.data.get("seen_by", [existing.author]), new.author})
-        changes: dict[str, Any] = {
-            "support": existing.support + 1,
-            "importance": max(existing.importance, new.importance),
-            "confidence": max(existing.confidence, new.confidence),
-            "entities": sorted({*existing.entities, *new.entities}),
-            "tags": sorted({*existing.tags, *new.tags}),
-            "data": {**existing.data, "seen_by": seen_by},
-            "provenance": existing.provenance.model_copy(update={
-                "source_events": sorted({*existing.provenance.source_events, *new.provenance.source_events}),
-            }),
-        }
-        if existing.status is MemoryStatus.PROPOSED and new.status is MemoryStatus.ACTIVE:
-            changes["status"] = MemoryStatus.ACTIVE
-        return self.store.update(existing.id, actor=new.author, op="reinforce", **changes)
+        def changes(cur: MemoryRecord) -> dict[str, Any]:
+            out: dict[str, Any] = {
+                "support": cur.support + 1,
+                "importance": max(cur.importance, new.importance),
+                "confidence": max(cur.confidence, new.confidence),
+                "entities": sorted({*cur.entities, *new.entities}),
+                "tags": sorted({*cur.tags, *new.tags}),
+                "data": {**cur.data, "seen_by": sorted({*cur.data.get("seen_by", [cur.author]), new.author})},
+                "provenance": cur.provenance.model_copy(update={
+                    "source_events": sorted({*cur.provenance.source_events, *new.provenance.source_events}),
+                }),
+            }
+            if cur.status is MemoryStatus.PROPOSED and new.status is MemoryStatus.ACTIVE:
+                out["status"] = MemoryStatus.ACTIVE
+            return out
+
+        return self.store.mutate(existing.id, changes, actor=new.author, op="reinforce")
 
     def _near_duplicate(self, rec: MemoryRecord) -> MemoryRecord | None:
         probe = terms(rec.title)
@@ -321,46 +346,57 @@ class SharedMemory:
         )
 
     def _retire(self, old: MemoryRecord, new: MemoryRecord, actor: str) -> None:
-        if old.status is not MemoryStatus.ACTIVE and old.status is not MemoryStatus.PROPOSED:
-            return
-        self.store.update(
-            old.id, actor=actor, op="supersede", note=f"superseded by {new.id}",
-            status=MemoryStatus.SUPERSEDED, valid_to=self.clock(), superseded_by=new.id,
-        )
-        self.store.link(new.id, old.id, "supersedes")
+        def changes(cur: MemoryRecord) -> dict[str, Any] | None:
+            if not cur.is_live:   # already superseded/rejected/resolved by someone else
+                return None
+            return {"status": MemoryStatus.SUPERSEDED, "valid_to": self.clock(), "superseded_by": new.id}
+
+        with self.store.transaction():
+            retired = self.store.mutate(old.id, changes, actor=actor, op="supersede", note=f"superseded by {new.id}")
+            if retired.superseded_by == new.id:
+                self.store.link(new.id, old.id, "supersedes")
 
     # ----------------------------------------------------------- lifecycle
     def accept(self, record_id: str, curator: str, *, note: str | None = None) -> MemoryRecord:
-        rec = self._require(record_id)
-        if rec.status is not MemoryStatus.PROPOSED:
-            return rec
-        trust = rec.provenance.trust if rec.provenance.trust.rank >= Trust.CURATED.rank else Trust.CURATED
-        accepted = self.store.update(
-            rec.id, actor=curator, op="accept", note=note, status=MemoryStatus.ACTIVE,
-            provenance=rec.provenance.model_copy(update={"trust": trust}),
-            data={**rec.data, "accepted_by": curator},
-        )
-        to_retire: set[str] = set(rec.data.get("conflicts_with", []))
-        if rec.data.get("proposes_to_supersede"):
-            to_retire.add(rec.data["proposes_to_supersede"])
-        if rec.subject and kind_policy(rec.kind).subject_keyed:
-            to_retire.update(h.id for h in self._subject_holders(rec.scope, rec.kind, rec.subject) if h.id != rec.id)
-        for old in self.store.get_many(sorted(to_retire)):
-            self._retire(old, accepted, curator)
-        return self._require(rec.id)
+        with self.store.transaction():
+            rec = self._require(record_id)
+            if rec.status is not MemoryStatus.PROPOSED:
+                return rec
+
+            def changes(cur: MemoryRecord) -> dict[str, Any] | None:
+                if cur.status is not MemoryStatus.PROPOSED:
+                    return None
+                trust = cur.provenance.trust if cur.provenance.trust.rank >= Trust.CURATED.rank else Trust.CURATED
+                return {"status": MemoryStatus.ACTIVE, "provenance": cur.provenance.model_copy(update={"trust": trust}),
+                        "data": {**cur.data, "accepted_by": curator}}
+
+            accepted = self.store.mutate(rec.id, changes, actor=curator, op="accept", note=note)
+            to_retire: set[str] = set(accepted.data.get("conflicts_with", []))
+            if accepted.data.get("proposes_to_supersede"):
+                to_retire.add(accepted.data["proposes_to_supersede"])
+            if accepted.subject and kind_policy(accepted.kind).subject_keyed:
+                to_retire.update(h.id for h in self._subject_holders(accepted.scope, accepted.kind, accepted.subject)
+                                 if h.id != accepted.id)
+            for old in self.store.get_many(sorted(to_retire)):
+                self._retire(old, accepted, curator)
+            return self._require(rec.id)
 
     def reject(self, record_id: str, curator: str, reason: str) -> MemoryRecord:
-        rec = self._require(record_id)
-        return self.store.update(
-            rec.id, actor=curator, op="reject", note=reason, status=MemoryStatus.REJECTED,
-            valid_to=self.clock(), data={**rec.data, "rejection_reason": reason},
+        self._require(record_id)
+        return self.store.mutate(
+            record_id,
+            lambda cur: {"status": MemoryStatus.REJECTED, "valid_to": self.clock(),
+                         "data": {**cur.data, "rejection_reason": reason}},
+            actor=curator, op="reject", note=reason,
         )
 
     def resolve(self, record_id: str, actor: str, note: str = "") -> MemoryRecord:
-        rec = self._require(record_id)
-        return self.store.update(
-            rec.id, actor=actor, op="resolve", note=note, status=MemoryStatus.RESOLVED,
-            valid_to=self.clock(), data={**rec.data, "resolution": note},
+        self._require(record_id)
+        return self.store.mutate(
+            record_id,
+            lambda cur: {"status": MemoryStatus.RESOLVED, "valid_to": self.clock(),
+                         "data": {**cur.data, "resolution": note}},
+            actor=actor, op="resolve", note=note,
         )
 
     def challenge(
@@ -368,37 +404,42 @@ class SharedMemory:
         role: str | None = None,
     ) -> WriteResult:
         """Adversarial review: open a question against a decision; the curator settles it."""
-        target = self._require(record_id)
-        body = argument + (f"\nProposed alternative: {alternative}" if alternative else "")
-        result = self.remember(
-            scope=target.scope, kind=MemoryKind.CLARIFICATION, author=challenger, role=role,
-            title=f"Challenge to {target.id}: {first_line(argument, 100)}", body=body,
-            data={"question": argument, "alternative": alternative, "target": target.id, "open": True},
-            entities=target.entities, tags=["challenge"], status=MemoryStatus.ACTIVE,
-        )
-        self.store.link(result.record.id, target.id, "challenges")
-        self.store.update(
-            target.id, actor=challenger, op="challenged",
-            data={**target.data, "open_challenges": sorted({*target.data.get("open_challenges", []),
-                                                            result.record.id})},
-        )
-        return result
+        with self.store.transaction():
+            target = self._require(record_id)
+            body = argument + (f"\nProposed alternative: {alternative}" if alternative else "")
+            result = self.remember(
+                scope=target.scope, kind=MemoryKind.CLARIFICATION, author=challenger, role=role,
+                title=f"Challenge to {target.id}: {first_line(argument, 100)}", body=body,
+                data={"question": argument, "alternative": alternative, "target": target.id, "open": True},
+                entities=target.entities, tags=["challenge"], status=MemoryStatus.ACTIVE,
+            )
+            self.store.link(result.record.id, target.id, "challenges")
+            self.store.mutate(
+                target.id,
+                lambda cur: {"data": {**cur.data, "open_challenges": sorted(
+                    {*cur.data.get("open_challenges", []), result.record.id})}},
+                actor=challenger, op="challenged",
+            )
+            return result
 
     def answer(self, clarification_id: str, answer: str, actor: str) -> MemoryRecord:
-        rec = self._require(clarification_id)
-        updated = self.store.update(
-            rec.id, actor=actor, op="answer",
-            body=f"{rec.body}\nAnswer: {answer}".strip(),
-            data={**rec.data, "answer": answer, "answered_by": actor, "open": False},
-        )
-        target_id = rec.data.get("target")
-        if target_id:
-            target = self.store.get(target_id)
-            if target is not None:
-                remaining = [c for c in target.data.get("open_challenges", []) if c != rec.id]
-                self.store.update(target.id, actor=actor, op="challenge_answered",
-                                  data={**target.data, "open_challenges": remaining})
-        return updated
+        with self.store.transaction():
+            self._require(clarification_id)
+            updated = self.store.mutate(
+                clarification_id,
+                lambda cur: {"body": f"{cur.body}\nAnswer: {answer}".strip(),
+                             "data": {**cur.data, "answer": answer, "answered_by": actor, "open": False}},
+                actor=actor, op="answer",
+            )
+            target_id = updated.data.get("target")
+            if target_id and self.store.get(target_id) is not None:
+                self.store.mutate(
+                    target_id,
+                    lambda cur: {"data": {**cur.data, "open_challenges": [
+                        c for c in cur.data.get("open_challenges", []) if c != clarification_id]}},
+                    actor=actor, op="challenge_answered",
+                )
+            return updated
 
     # ----------------------------------------------------------------- reads
     def get(self, record_id: str) -> MemoryRecord | None:
@@ -490,20 +531,18 @@ class SharedMemory:
         if self.embedder is None or not records:
             return {}
         try:
-            missing = [r for r in records if self.store.get_vector(r.id, r.content_hash) is None]
+            vectors = self.store.get_vectors({r.id: r.content_hash for r in records})
+            missing = [r for r in records if r.id not in vectors]
             if missing:
                 vecs = self.embedder.embed([f"{r.title}\n{r.body}" for r in missing])
-                for r, v in zip(missing, vecs):
+                for r, v in zip(missing, vecs, strict=True):
                     self.store.put_vector(r.id, r.content_hash, v)
+                    vectors[r.id] = list(v)
             qv = self.embedder.embed([query])[0]
-        except Exception:  # noqa: BLE001 - embeddings are an optional boost
+        except Exception:  # embeddings are an optional boost; recall still works without them
+            logger.warning("embedding failed; recall continues without vector scores", exc_info=True)
             return {}
-        out: dict[str, float] = {}
-        for r in records:
-            v = self.store.get_vector(r.id, r.content_hash)
-            if v is not None:
-                out[r.id] = max(0.0, _cosine(qv, v))
-        return out
+        return {rid: max(0.0, _cosine(qv, v)) for rid, v in vectors.items()}
 
     def index(self, records: Iterable[MemoryRecord]) -> str:
         return "\n".join(render_index_line(r) for r in records)

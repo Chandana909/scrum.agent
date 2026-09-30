@@ -32,8 +32,8 @@ is implemented in `aamt_context`.
 |---|---|---|---|
 | N1 | Modular: develop independently of aamt, integrate with minimal changes | user request | separate package; framework-free core; adapters in `integrations/`; aamt patch = 6 files / ~60 changed lines + 1 wiring module |
 | N2 | Works without an LLM (tests, outages, key exhaustion) | aamt style (every LLM call has a deterministic fallback) | extractive checkpoint, marker-based minutes, keyword team scoping; `llm` is optional everywhere |
-| N3 | Idempotent ingestion (resume, replayed events) | Plan §10.3 | `source_key` uniqueness, `store.claim(event:<id>)` |
-| N4 | Concurrency-safe for parallel/recursive agents | PDF §7-10; config `max_concurrent_agents` | SQLite WAL + lock, compare-and-swap `version`, per-reader cursors, append-only logs |
+| N3 | Idempotent ingestion (resume, replayed events) | Plan §10.3 | `source_key` uniqueness, `store.claim(event:<id>)` after the handler succeeds (failed events are retried), replay-safe `record_handoff` and message ids |
+| N4 | Concurrency-safe for parallel/recursive agents | PDF §7-10; config `max_concurrent_agents` | SQLite WAL, `BEGIN IMMEDIATE` transactions with savepoints, compare-and-swap `version`, `store.mutate` for derived updates, per-reader cursors, append-only logs (tested with threads and processes) |
 | N5 | Provider-agnostic (OpenRouter/Qwen/Mistral today) | `llm/provider.py` | `TextLLM` protocol; chars/4 token heuristic by default; optional tiktoken |
 | N6 | Cheap to operate; inspectable | MVP | SQLite single file per project (`.aamt/context.db`), FTS5 BM25, optional embeddings |
 | N7 | Safe with untrusted content (tool output, web, repo files) | PRD §33 | `Trust` levels; tool-derived shared memory is a proposal; rendered fenced "treat as data" |

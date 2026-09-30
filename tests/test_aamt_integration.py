@@ -7,12 +7,12 @@ from typing import Any
 import pytest
 
 pytest.importorskip("aamt")
-from aamt.agents.developer import render_task_context  # noqa: E402
-from aamt.agents.messaging import Mailbox  # noqa: E402
-from aamt.agents.roles import role_spec  # noqa: E402
-from aamt.config import Settings  # noqa: E402
-from aamt.events.bus import EventBus  # noqa: E402
-from aamt.models import (  # noqa: E402
+from aamt.agents.developer import render_task_context
+from aamt.agents.messaging import Mailbox
+from aamt.agents.roles import role_spec
+from aamt.config import Settings
+from aamt.events.bus import EventBus
+from aamt.models import (
     AcceptanceCriterion,
     Agent,
     EventType,
@@ -23,14 +23,14 @@ from aamt.models import (  # noqa: E402
     Sprint,
     Task,
 )
-from aamt.state.store import ProjectStore  # noqa: E402
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage  # noqa: E402
+from aamt.state.store import ProjectStore
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from aamt_context.engine import ContextEngine  # noqa: E402
-from aamt_context.integrations.aamt import AamtContextBridge, ChannelMailbox  # noqa: E402
-from aamt_context.types import MemoryKind, MemoryStatus, Scope  # noqa: E402
+from aamt_context.engine import ContextEngine
+from aamt_context.integrations.aamt import AamtContextBridge, ChannelMailbox
+from aamt_context.types import MemoryKind, MemoryStatus, Scope
 
-from .test_langchain_integration import ScriptedChatModel  # noqa: E402
+from .test_langchain_integration import ScriptedChatModel
 
 
 @pytest.fixture
@@ -54,8 +54,8 @@ def env(tmp_path):
               description="Issue a JWT for valid credentials using the UserStore",
               acceptance_criteria=[AcceptanceCriterion(text="POST /login returns 200 with a token")])
     store.save_tasks([t1, t2])
-    yield dict(store=store, bus=bus, engine=engine, bridge=bridge, project=project, backend=backend, db=db,
-               t1=t1, t2=t2)
+    yield {"store": store, "bus": bus, "engine": engine, "bridge": bridge, "project": project,
+           "backend": backend, "db": db, "t1": t1, "t2": t2}
     engine.close()
     bus.close()
     store.close()

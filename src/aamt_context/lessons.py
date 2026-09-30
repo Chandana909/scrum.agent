@@ -108,8 +108,10 @@ class LessonConsolidator:
             for item in (data or {}).get("lessons", []) or []:
                 if not isinstance(item, dict) or not str(item.get("lesson", "")).strip():
                     continue
-                polarity = item.get("polarity") if item.get("polarity") in ("negative", "positive", "change") else "change"
-                team = item.get("team") if item.get("team") in self.team_keywords else None
+                raw_polarity = str(item.get("polarity") or "")
+                polarity = raw_polarity if raw_polarity in ("negative", "positive", "change") else "change"
+                raw_team = item.get("team")
+                team = raw_team if isinstance(raw_team, str) and raw_team in self.team_keywords else None
                 rewritten.append((polarity, str(item["lesson"]).strip(), team))
             if rewritten:
                 return rewritten

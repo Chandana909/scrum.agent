@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: lint · types · tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Install (exactly the locked versions)
+        run: uv sync --locked
+      - name: Lint
+        run: uv run ruff check src tests docs/spikes
+      - name: Type check
+        run: uv run pyright
+      - name: Tests
+        run: uv run pytest
+
+  aamt-integration:
+    name: patch applies to aamt and aamt's tests pass
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AAMT_COMMIT: 516a4be53a56ca8952b3ff46f9e124f1de868e6d
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          path: aamt-context
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: Krishil-Parikh/scrum-master-agent
+          ref: ${{ env.AAMT_COMMIT }}
+          path: aamt
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
+        with:
+          python-version: "3.11"
+      - name: Apply the integration patch
+        working-directory: aamt
+        run: |
+          git apply --check ../aamt-context/integration/aamt-context.patch
+          git apply ../aamt-context/integration/aamt-context.patch
+      - name: Install aamt with aamt-context
+        working-directory: aamt
+        run: |
+          uv venv
+          uv pip install -e . -e ../aamt-context pytest pytest-asyncio
+      - name: aamt's test suite (minus the 4 tests that call a live OpenRouter model)
+        working-directory: aamt
+        run: >
+          .venv/bin/python -m pytest -q
+          --deselect tests/test_agent_base.py::test_real_completion_is_ok
+          --deselect tests/test_agent_base.py::test_leaked_tool_call_text_is_failure
+          --deselect tests/test_agent_base.py::test_empty_output_no_tools_is_failure
+          --deselect tests/test_agent_base.py::test_blocked_claim_flag

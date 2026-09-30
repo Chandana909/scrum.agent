@@ -65,12 +65,20 @@ Dependencies only point downwards. The core never imports LangChain, LangGraph o
 ## 4. Main flows
 
 **4.1 Event ingestion (aamt)** — `bus.subscribe(bridge.ingest_event)`:
-1. `store.claim("event:<id>")`; a replayed event stops here.
-2. Handler by event type (`_on_<type>`), e.g. `TASK_COMPLETED` → read the latest completion-claim note
-   for the task → `HandoffReport.from_text` (+ commit hash, files from `git diff-tree`) →
-   `engine.record_handoff` (subject `handoff:<task>`; proposals for decisions/interfaces) → resolve the
-   task's open blockers.
-3. Errors are collected in `bridge.errors`; the producer is never interrupted.
+1. `store.is_claimed("event:<id>")`: an event already processed stops here.
+2. Handler by event type (`_on_<type>`). For example, `TASK_COMPLETED` does four things:
+   * reads the latest completion-claim note for the task;
+   * builds a `HandoffReport` with `HandoffReport.from_text`, adding the commit hash and the files
+     from `git diff-tree`;
+   * calls `engine.record_handoff` (subject `handoff:<task>`, proposals for decisions and
+     interfaces, one transaction, replay-safe);
+   * resolves the task's open blockers.
+
+   Handlers are idempotent: every write carries a `source_key` derived from the event id, and
+   messages get the id `CM-<event id>`.
+3. `store.claim("event:<id>")` runs **only after the handler succeeds**. If a handler fails, for
+   example because the database is locked, the error is logged and kept in `bridge.errors`, and the
+   event is processed again the next time it is delivered. The producer is never interrupted.
 
 **4.2 Building a brief** — `engine.build_brief(TaskBrief, ReaderContext)`:
 1. Visibility from the reader (task chain + team + agent + project + org).
@@ -101,7 +109,11 @@ facilitator → minutes summary record → channel closed.
 
 1. Nothing is deleted: supersession, rejection, resolution, masking and condensation are all recorded
    state changes or events.
-2. Every update is compare-and-swap on `version` and leaves a history snapshot.
+2. Every update is compare-and-swap on `version` and leaves a history snapshot. Derived updates
+   (`support + 1`, merged `data`) go through `store.mutate`, which computes them from the current row
+   under the write lock, so concurrent writers never lose an update. Multi-record operations are
+   atomic: writing a record and retiring what it supersedes, accepting a proposal, recording a
+   handoff, and closing a meeting each use one `store.transaction()`.
 3. At most one `ACTIVE` record per (kind, subject) along a scope chain, for subject-keyed kinds.
 4. Curated or human records are never superseded by a non-curator; the attempt becomes a conflict
    proposal.
@@ -153,9 +165,21 @@ entity 0.8, importance 0.5, recency 0.3, scope 0.6, vector 1.0, sprint 0.1.
   noticeable only on very large repos (capped at 3 000 files).
 * `ContextSession.view()` recomputes the projection each call (linear in entries) — fine for runs of
   hundreds of steps; memoise if runs get much longer.
-* One SQLite connection per engine with an RLock: safe for threads in one process; multiple processes
-  can share the file (SQLite locking + CAS), with cursors and `claim()` keeping delivery/ingestion
-  correct.
+* One SQLite connection per engine with an RLock handles threads in one process. For several
+  processes on one file:
+  * every write transaction starts with `BEGIN IMMEDIATE` (nested blocks become savepoints), so
+    read-then-write steps are atomic across processes;
+  * `busy_timeout_s` (default 30 s) bounds the wait for another writer;
+  * cursors and `claim()` keep delivery and ingestion correct.
+
+  This is tested with 8 threads and with 2 processes reinforcing the same record: no lost updates.
+* The default is `synchronous=NORMAL`, SQLite's recommended mode with a write-ahead log (WAL). It
+  can't corrupt the file, but a power cut can drop the last few commits. Pass `synchronous="FULL"`
+  when every commit must survive a power cut.
+* The schema version is kept in `PRAGMA user_version`. A database written by a newer schema raises
+  `SchemaVersionError` instead of being misread.
+* Measured with 5,000 records on a laptop SSD: `remember` ≈3.4 ms, `recall` ≈8 ms,
+  `build_brief` ≈50 ms, and `session.view()` over 600 entries ≈11 ms.
 * Token counts are chars/4 estimates by default (conservative); pass `TiktokenCounter` or a
   provider-specific counter for precision.
 

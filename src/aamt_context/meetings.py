@@ -415,21 +415,26 @@ class MeetingRoom:
         if current.ended_at is not None:
             raise MeetingClosed(meeting.id)
         curator = curator or current.facilitator
+        # extraction may call an LLM: do it before taking the write lock
         minutes = (extractor or self.extractor).extract(
             self.messages(current), agenda=current.agenda, names=names
         )
-        records = self._persist(current, minutes, curator, sprint_id)
-        summary = self.memory.remember(
-            scope=Scope.project(current.project_id), kind=MemoryKind.SUMMARY, author=curator,
-            title=f"Minutes: {current.title}", body=minutes.render(),
-            tags=["meeting", current.kind.value], entities=[current.id], source_ref=current.id,
-            source_key=f"minutes:{current.id}", sprint_id=sprint_id,
-            data={"meeting": current.id, "kind": current.kind.value},
-        )
-        ended = current.model_copy(update={"ended_at": self.clock(), "minutes_record_id": summary.record.id})
-        self.hub.store.update_channel(
-            current.channel, meta={"meeting": ended.model_dump(mode="json")}, closed_at=ended.ended_at,
-        )
+        with self.memory.store.transaction():   # minutes, summary and closing land together
+            current = self.get(meeting.project_id, meeting.id)
+            if current.ended_at is not None:     # closed concurrently while we were extracting
+                raise MeetingClosed(meeting.id)
+            records = self._persist(current, minutes, curator, sprint_id)
+            summary = self.memory.remember(
+                scope=Scope.project(current.project_id), kind=MemoryKind.SUMMARY, author=curator,
+                title=f"Minutes: {current.title}", body=minutes.render(),
+                tags=["meeting", current.kind.value], entities=[current.id], source_ref=current.id,
+                source_key=f"minutes:{current.id}", sprint_id=sprint_id,
+                data={"meeting": current.id, "kind": current.kind.value},
+            )
+            ended = current.model_copy(update={"ended_at": self.clock(), "minutes_record_id": summary.record.id})
+            self.hub.store.update_channel(
+                current.channel, meta={"meeting": ended.model_dump(mode="json")}, closed_at=ended.ended_at,
+            )
         return MeetingOutcome(meeting=ended, minutes=minutes, records=records, summary=summary)
 
     # persistence ---------------------------------------------------------
